@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "2.0"
+type JsonObject = dict[str, object]
+
+OperationKind = Literal["set-float", "set-choice", "set-bool", "graph-action"]
+OperationMode = Literal["delta", "set"]
 RefinementMode = Literal["single-turn", "multi-turn"]
 
 
@@ -29,6 +33,19 @@ class RequestSession(StrictBaseModel):
     turnId: str = Field(min_length=1)
 
 
+class ResponseSession(StrictBaseModel):
+    appSessionId: str
+    imageSessionId: str
+    conversationId: str
+    turnId: str
+
+
+class UIContext(StrictBaseModel):
+    view: str = Field(min_length=1)
+    imageId: int | None = None
+    imageName: str | None = None
+
+
 class RefinementRequest(StrictBaseModel):
     mode: RefinementMode
     enabled: bool
@@ -37,14 +54,12 @@ class RefinementRequest(StrictBaseModel):
     goalText: str = Field(min_length=1)
 
     @model_validator(mode="after")
-    def _validate(self) -> "RefinementRequest":
+    def validate_live_run(self) -> "RefinementRequest":
         expected: RefinementMode = "multi-turn" if self.enabled else "single-turn"
         if self.mode != expected:
             raise ValueError("refinement mode does not match enabled flag")
         if self.passIndex > self.maxPasses:
             raise ValueError("passIndex must be <= maxPasses")
-        if not self.enabled and (self.maxPasses != 1 or self.passIndex != 1):
-            raise ValueError("single-turn runs must use passIndex=1 and maxPasses=1")
         if not self.enabled or self.mode != "multi-turn":
             raise ValueError("vkdtAgent only supports multi-turn live refinement")
         if self.maxPasses < 2:
@@ -52,101 +67,140 @@ class RefinementRequest(StrictBaseModel):
         return self
 
 
-class WorkspaceContext(StrictBaseModel):
-    imagePath: str = Field(min_length=1)
-    graphPath: str | None = None
-    graphText: str | None = None
-    sessionRoot: str | None = None
-    previewWidth: int = Field(default=1600, ge=64)
-    previewHeight: int = Field(default=900, ge=64)
-    defaultRenderFormat: str = Field(default="o-jpg", min_length=1)
+class RefinementStatus(StrictBaseModel):
+    mode: RefinementMode
+    enabled: bool
+    passIndex: int = Field(ge=1)
+    maxPasses: int = Field(ge=1)
+    continueRefining: bool
+    stopReason: Literal[
+        "planner-complete",
+        "cancelled",
+        "tool-budget",
+        "render-timeout",
+        "error",
+    ]
+
+
+class PreviewImage(StrictBaseModel):
+    previewId: str = Field(min_length=1)
+    mimeType: str = Field(min_length=1)
+    width: int | None = Field(default=None, gt=0)
+    height: int | None = Field(default=None, gt=0)
+    base64Data: str = Field(min_length=1)
+
+
+class ChoiceOption(StrictBaseModel):
+    choiceValue: int
+    choiceId: str = Field(min_length=1)
+    label: str = Field(min_length=1)
+
+
+class Capability(StrictBaseModel):
+    moduleId: str = Field(min_length=1)
+    moduleLabel: str = Field(min_length=1)
+    capabilityId: str = Field(min_length=1)
+    label: str = Field(min_length=1)
+    kind: Literal["set-float", "set-choice", "set-bool"]
+    targetType: Literal["vkdt-action", "vkdt-graph"]
+    actionPath: str = Field(min_length=1)
+    supportedModes: list[OperationMode] = Field(min_length=1)
+    minNumber: float | None = None
+    maxNumber: float | None = None
+    defaultNumber: float | None = None
+    stepNumber: float | None = None
+    choices: list[ChoiceOption] | None = None
+    defaultChoiceValue: int | None = None
+    defaultBool: bool | None = None
+
+
+class CapabilityManifest(StrictBaseModel):
+    manifestVersion: str = Field(min_length=1)
+    targets: list[Capability] = Field(min_length=1)
+
+
+class EditableSetting(StrictBaseModel):
+    moduleId: str = Field(min_length=1)
+    moduleLabel: str = Field(min_length=1)
+    settingId: str = Field(min_length=1)
+    capabilityId: str = Field(min_length=1)
+    label: str = Field(min_length=1)
+    actionPath: str = Field(min_length=1)
+    kind: Literal["set-float", "set-choice", "set-bool"]
+    supportedModes: list[OperationMode] = Field(min_length=1)
+    currentNumber: float | None = None
+    minNumber: float | None = None
+    maxNumber: float | None = None
+    defaultNumber: float | None = None
+    stepNumber: float | None = None
+    currentChoiceValue: int | None = None
+    currentChoiceId: str | None = None
+    choices: list[ChoiceOption] | None = None
+    defaultChoiceValue: int | None = None
+    currentBool: bool | None = None
+    defaultBool: bool | None = None
+
+
+class ImageHistoryItem(StrictBaseModel):
+    num: int
+    module: str | None = None
+    enabled: bool
+    instanceName: str | None = None
+
+
+class ImageSnapshot(StrictBaseModel):
+    imageRevisionId: str = Field(min_length=1)
+    graphPath: str = Field(min_length=1)
+    graphText: str = Field(min_length=1)
+    moduleOrder: list[str]
+    modules: list[JsonObject]
+    connections: list[dict[str, str]]
+    adjustmentSurfaces: list[JsonObject]
+    editableSettings: list[EditableSetting]
+    history: list[ImageHistoryItem]
+    preview: PreviewImage | None = None
 
 
 class RequestEnvelope(StrictBaseModel):
     schemaVersion: str = SCHEMA_VERSION
     requestId: str = Field(min_length=1)
     session: RequestSession
+    uiContext: UIContext
     message: UserMessage
-    workspace: WorkspaceContext
+    capabilityManifest: CapabilityManifest
+    imageSnapshot: ImageSnapshot
     fast: bool = False
     refinement: RefinementRequest
 
 
-class PreviewImage(StrictBaseModel):
-    previewId: str = Field(min_length=1)
-    mimeType: str = Field(min_length=1)
-    width: int | None = None
-    height: int | None = None
-    base64Data: str = Field(min_length=1)
-
-
-class RenderedArtifact(StrictBaseModel):
-    kind: Literal["preview", "export"]
-    format: str = Field(min_length=1)
-    path: str = Field(min_length=1)
-    mimeType: str = Field(min_length=1)
-
-
-class GraphEdit(StrictBaseModel):
-    kind: Literal[
-        "set_param",
-        "add_module",
-        "remove_module",
-        "connect",
-        "disconnect",
-        "insert_module_after",
-    ]
-    module: str | None = None
-    instance: str | None = None
-    param: str | None = None
-    values: list[str | int | float | bool] | None = None
-    x: int | None = None
-    y: int | None = None
-    srcModule: str | None = None
-    srcInstance: str | None = None
-    srcConnector: str | None = None
-    dstModule: str | None = None
-    dstInstance: str | None = None
-    dstConnector: str | None = None
-    afterModule: str | None = None
-    afterInstance: str | None = None
-    inputConnector: str | None = None
-    outputConnector: str | None = None
-
-
-class ExportRequest(StrictBaseModel):
-    format: str = Field(min_length=1)
-    filename: str = Field(min_length=1)
-    width: int | None = Field(default=None, ge=1)
-    height: int | None = Field(default=None, ge=1)
-    quality: float | None = Field(default=None, ge=0, le=100)
-    output: str = Field(default="main", min_length=1)
-    lastFrameOnly: bool = True
-
-
-class WorkflowState(StrictBaseModel):
-    graphPath: str = Field(min_length=1)
-    graphText: str = Field(min_length=1)
-    moduleOrder: list[str]
-    modules: list[dict[str, Any]]
-    connections: list[dict[str, str]]
-    adjustmentSurfaces: list[dict[str, Any]]
-    exports: list[RenderedArtifact]
-    preview: PreviewImage | None
+class GraphOperation(StrictBaseModel):
+    kind: OperationKind
+    targetType: Literal["vkdt-action", "vkdt-graph"]
+    actionPath: str = Field(min_length=1)
+    mode: OperationMode | None = None
+    valueNumber: float | None = None
+    valueBool: bool | None = None
+    valueChoiceId: str | None = None
+    graphPayload: JsonObject | None = None
+    summary: str | None = None
 
 
 class AgentPlan(StrictBaseModel):
     assistantText: str = Field(min_length=1)
     continueRefining: bool
-    operations: list[GraphEdit]
-    workflow: WorkflowState
+    operations: list[GraphOperation]
+
+
+class ErrorInfo(StrictBaseModel):
+    code: str = Field(min_length=1)
+    message: str = Field(min_length=1)
 
 
 class ResponseEnvelope(StrictBaseModel):
     requestId: str = Field(min_length=1)
-    session: RequestSession
+    session: ResponseSession
     status: Literal["ok", "error"]
     assistantMessage: AssistantMessage
+    refinement: RefinementStatus
     plan: AgentPlan | None
-    workflow: WorkflowState | None
-    error: dict[str, str] | None = None
+    error: ErrorInfo | None = None

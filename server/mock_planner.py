@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
-from shared.protocol import AgentPlan, GraphEdit, RequestEnvelope
-
-from .session import VkdtSession
-from .vkdt_runner import VkdtRunner
+from server.bridge_types import RequestProgressPayload
+from shared.protocol import AgentPlan, GraphOperation, RequestEnvelope
 
 
 @dataclass(slots=True)
@@ -19,24 +16,25 @@ class MockTurnResult:
 
 class MockPlannerBridge:
     def plan(self, request: RequestEnvelope) -> MockTurnResult:
-        fake_vkdt = Path(__file__).resolve().parent / "tests" / "fake_vkdt_cli.py"
-        session = VkdtSession.create(
-            request,
-            runner=VkdtRunner(command=["python3", str(fake_vkdt)]),
+        first_setting = request.imageSnapshot.editableSettings[0]
+        operation = GraphOperation(
+            kind=first_setting.kind,
+            targetType="vkdt-action",
+            actionPath=first_setting.actionPath,
+            mode="delta" if "delta" in first_setting.supportedModes else "set",
+            valueNumber=0.25 if first_setting.kind == "set-float" else None,
+            valueBool=True if first_setting.kind == "set-bool" else None,
+            valueChoiceId=(
+                first_setting.choices[0].choiceId
+                if first_setting.kind == "set-choice" and first_setting.choices
+                else None
+            ),
+            summary=f"Adjust {first_setting.label}",
         )
-        operation = GraphEdit(
-            kind="set_param",
-            module="colour",
-            instance="01",
-            param="exposure",
-            values=[0.5],
-        )
-        session.apply_edits([operation])
         plan = AgentPlan(
-            assistantText="Raised exposure slightly in mock mode.",
+            assistantText="Prepared one native vkdt edit operation in mock mode.",
             continueRefining=False,
             operations=[operation],
-            workflow=session.workflow_state(),
         )
         return MockTurnResult(
             plan=plan,
@@ -44,3 +42,57 @@ class MockPlannerBridge:
             turn_id="mock-turn-1",
             raw_message=plan.model_dump_json(),
         )
+
+    def cancel_request(
+        self,
+        *,
+        request_id: str,
+        app_session_id: str,
+        image_session_id: str,
+        conversation_id: str,
+        turn_id: str,
+        reason: str | None = None,
+    ) -> bool:
+        del (
+            request_id,
+            app_session_id,
+            image_session_id,
+            conversation_id,
+            turn_id,
+            reason,
+        )
+        return True
+
+    def get_request_progress(
+        self,
+        *,
+        request_id: str,
+        app_session_id: str,
+        image_session_id: str,
+        conversation_id: str,
+        turn_id: str,
+    ) -> RequestProgressPayload:
+        del request_id, app_session_id, image_session_id, conversation_id, turn_id
+        return {
+            "found": False,
+            "status": "not_found",
+            "toolCallsUsed": 0,
+            "maxToolCalls": 0,
+            "appliedOperationCount": 0,
+            "operations": [],
+            "latestOperation": None,
+            "message": "No active request found.",
+            "lastToolName": None,
+            "progressVersion": 0,
+            "requiresRenderCallback": False,
+        }
+
+    def provide_render_callback(
+        self,
+        *,
+        image_session_id: str,
+        turn_id: str,
+        image_bytes: bytes,
+    ) -> bool:
+        del image_session_id, turn_id, image_bytes
+        return True

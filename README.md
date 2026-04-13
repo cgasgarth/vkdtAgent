@@ -1,64 +1,75 @@
 # vkdtAgent
 
-`vkdtAgent` is a Codex-driven RAW editing workflow built around the [vkdt](https://github.com/hanatos/vkdt) node graph. It uses a local Python backend, a live Codex app-server bridge, and a graph-first editing protocol so requests become concrete `vkdt` module, connection, and parameter edits.
+`vkdtAgent` is a Codex-driven agent backend for the native [`vkdt`](https://github.com/hanatos/vkdt) UI.
 
-`vkdt` remains the rendering engine and graph source of truth. The backend manages a working `.cfg`, renders previews and exports through `vkdt-cli`, and gives Codex a tool surface built directly on the `vkdt` module graph.
+The design now mirrors the darktable-style architecture:
+
+- the running `vkdt` app is the source of truth
+- the Python backend plans edits with Codex
+- the native app applies operations locally in the real UI session
+- the native app sends refreshed preview renders back mid-turn
 
 ## Features
 
-- Live Codex app-server planning loop with graph-editing tools
-- Multi-turn only workflow with iterative state refresh after edits
-- Built-in browser client served by the FastAPI app
-- `vkdt` graph parser and serializer for `module`, `connect`, and `param` lines
-- Built-in default RAW graph when no sidecar exists yet
-- Built-in module catalog and adjustment surfaces covering the broader vkdt editing workflow
-- Headless preview and export rendering through `vkdt-cli`
-- Deterministic mock mode for smoke tests and CI
+- Native-UI-first architecture for `vkdt`
+- Multi-turn only live edit loop
+- Bounded Codex tool surface: state, preview, playbook, apply operations, end
+- Dynamic capability-manifest model so the app declares what is editable
+- Streamed progress and render callback flow for iterative editing
+- Built-in `vkdt` module catalog and playbooks for planning guidance
+- Mock mode for backend tests and CI
+
+## Endpoints
+
+- `POST /v1/chat`
+- `POST /v1/chat/stream`
+- `POST /v1/chat/cancel`
+- `POST /v1/chat/render`
+- `GET /health`
+
+The backend runs on `http://127.0.0.1:4000` by default.
 
 ## Architecture
 
-- `server/` contains the FastAPI backend, Codex bridge, and `vkdt` graph/runtime code
-- `shared/` contains the request and response protocol models
-- `docs/` documents the editing protocol and repo workflow
+- `server/app.py`: API surface, SSE stream, cancel endpoint, render callback endpoint
+- `server/bridge.py`: Codex app-server bridge and bounded tool routing
+- `server/bridge_types.py`: planner bridge interface
+- `server/mock_planner.py`: deterministic test planner
+- `shared/protocol.py`: app/backend protocol models
+- `docs/native-ui-bridge.md`: upstream `vkdt` hook points and native bridge plan
 
-Request flow:
+## Native vkdt Flow
 
-1. The client submits a prompt plus an image path and optional graph path.
-2. The backend creates or loads a working `vkdt` graph.
-3. Codex inspects the current graph, preview, and module catalog through structured tools.
-4. Codex applies graph edits live, previewing between steps as needed.
-5. Codex re-reads the current workflow state or preview after edits when it needs another pass.
-6. The run completes only when Codex explicitly calls `end` with the final assistant message.
-7. The backend returns the final graph state, preview, and any requested exports.
+1. Native `vkdt` captures the current graph, controls, history, and preview.
+2. It sends a turn to `/v1/chat/stream`.
+3. Codex inspects state and emits operations through `apply_operations`.
+4. Native `vkdt` applies those operations in the real UI session.
+5. Native `vkdt` rerenders and posts the refreshed preview to `/v1/chat/render`.
+6. Codex continues iterating until it calls `end`.
 
-Open the client at `http://127.0.0.1:4000/`.
+## Adjustment Surfaces
 
-## Core Workflow Coverage
+The backend keeps a broad built-in planning vocabulary for `vkdt`, including:
 
-The built-in module catalog, adjustment surfaces, and playbooks cover a broad still-photo workflow:
+- RAW ingest, hot pixels, denoise, demosaic, highlight recovery, alignment
+- crop, rotate, perspective, lens, chromatic aberration cleanup
+- exposure, white balance, tone mapping, OpenDRT, local contrast
+- zones, graduated filters, vignette, dehaze
+- grading, curves, sharpening, texture/detail tools
+- masks, draw, guided filtering, blend, inpaint, wavelet retouching
+- negative conversion, film simulation, grain, frame
+- output encoding and export stages
 
-- RAW ingest, hot pixel cleanup, and burst alignment
-- exposure and white balance
-- highlight recovery
-- denoise and demosaic choices
-- crop, rotate, and perspective
-- lens correction and chromatic aberration cleanup
-- tone mapping, dehaze, graduated filters, vignette, and film rendering
-- global and local contrast or sharpening
-- color grading and curves
-- local adjustments with mask, draw, guided, exposure, inpaint, wavelet, and blend nodes
-- negative conversion, film simulation, grain, and framing
-- still export to JPEG, EXR, or web output paths
+The native app should still send the live editable control surface dynamically each turn.
 
 ## Setup
 
 Prerequisites:
 
-- macOS or Linux
 - `python3` 3.14+
 - `uv`
 - `codex` CLI installed and authenticated for live runs
-- `vkdt-cli` available in `PATH`, or `VKDT_AGENT_VKDT_CLI` pointing at it
+- a native `vkdt` build patched or integrated to talk to this backend
 
 Install dependencies:
 
@@ -72,49 +83,23 @@ Start the backend:
 npm run server:start
 ```
 
-By default the backend runs on `127.0.0.1:4000`.
-
 ## Testing
-
-Run lint:
 
 ```bash
 npm run backend:lint
-```
-
-Run formatting check:
-
-```bash
 npm run backend:format:check
-```
-
-Run tests:
-
-```bash
 npm run backend:test
-```
-
-Run type checking:
-
-```bash
 npm run backend:typecheck
-```
-
-Run the deterministic smoke path:
-
-```bash
 npm run agent:smoke
 ```
 
 ## Mock Mode
 
-Set `VKDT_AGENT_USE_MOCK_RESPONSES=1` to exercise the API without a live Codex app-server process or a real `vkdt-cli` binary. This is what CI uses for smoke verification while preserving the same multi-turn request contract.
+Set `VKDT_AGENT_USE_MOCK_RESPONSES=1` to exercise the backend without a live Codex app-server or a patched native `vkdt` build.
 
 ## Upstream vkdt Tracking
 
 Tracked upstream metadata lives in `vkdt-upstream.json`.
-
-Check the current tracked state against upstream:
 
 ```bash
 npm run vkdt:upstream-status

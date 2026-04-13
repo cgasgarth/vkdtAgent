@@ -31,9 +31,6 @@ testpaths = ["server/tests"]
 [tool.setuptools.packages.find]
 include = ["server*", "shared*"]
 
-[tool.setuptools.package-data]
-server = ["client/*"]
-
 [tool.ruff]
 line-length = 88
 target-version = "py314"

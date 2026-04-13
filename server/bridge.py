@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import select
@@ -9,38 +10,28 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
-from shared.protocol import AgentPlan, ExportRequest, GraphEdit, RequestEnvelope
+from shared.protocol import AgentPlan, GraphOperation, RequestEnvelope
 
-from .session import VkdtSession
 from .vkdt_catalog import get_playbook, module_catalog, playbook_ids
 
 logger = logging.getLogger("vkdt_agent.codex")
 
 THREAD_INSTRUCTIONS = """You are vkdtAgent, an expert RAW photo editor
-operating vkdt through a structured node-graph editing interface.
+operating the native vkdt UI through a bounded app bridge.
 
 Core rules:
-- This is an image-editing workflow, not a coding workflow.
-- This interface is always a live multi-turn run.
-- Use only these tools in this run: get_workflow_state, get_preview_image,
-  get_module_catalog, get_playbook, apply_graph_edits, render_export, and end.
-- Do not call generic command execution, patching, filesystem editing, or
-  other workspace tools.
-- Think in vkdt graph terms: modules, instances, connections, and params.
-- Prefer coherent graph edits that preserve a valid main processing path.
-- Follow this loop: inspect state, apply edits, inspect the refreshed state or
-  preview if needed, continue iterating, then call end.
-- Use colour, hilite, filmcurv or OpenDRT, llap, crop, lens, grade, curves,
-  mask, draw, guided, blend, colenc, and export sinks when they fit the
-  request.
-- If the request is broad, make a strong professional edit rather than asking
-  for unnecessary clarification.
-- Use get_playbook only when it materially changes the plan.
-- After enough inspection, use apply_graph_edits instead of continuing to read.
-- In live runs, once the graph and output are satisfactory, call end with the
-  final user-facing message.
+- The running vkdt app is the source of truth.
+- This is always a live multi-turn edit loop.
+- Use only these tools: get_image_state, get_preview_image, get_playbook,
+  apply_operations, end.
+- Never invent state that is not present in the latest image state or preview.
+- Prefer concrete operations against surfaced actionPath values or explicit
+  graph actions.
+- After apply_operations, wait for the refreshed native preview/state before
+  continuing.
+- Finish by calling end with a concise user-facing summary.
 
 Return exactly one JSON object matching the output schema after tool calls."""
 
@@ -53,24 +44,53 @@ class CodexAppServerError(Exception):
         self.status_code = status_code
 
 
+@dataclass(frozen=True, slots=True)
+class CancelRequestKey:
+    request_id: str
+    app_session_id: str
+    image_session_id: str
+    conversation_id: str
+    turn_id: str
+
+
 @dataclass(slots=True)
 class ActiveRequest:
     request_id: str
+    app_session_id: str
+    image_session_id: str
     conversation_id: str
     client_turn_id: str
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    cancel_reason: str | None = None
+    thread_id: str | None = None
+    codex_turn_id: str | None = None
     status: str = "queued"
     message: str = "Request accepted"
-    cancel_event: threading.Event = field(default_factory=threading.Event)
-    thread_id: str | None = None
-    turn_id: str | None = None
+    last_tool_name: str | None = None
+    progress_version: int = 0
+
+    @property
+    def cancel_key(self) -> CancelRequestKey:
+        return CancelRequestKey(
+            request_id=self.request_id,
+            app_session_id=self.app_session_id,
+            image_session_id=self.image_session_id,
+            conversation_id=self.conversation_id,
+            turn_id=self.client_turn_id,
+        )
 
 
 @dataclass(slots=True)
 class TurnContext:
     request: RequestEnvelope
-    session: VkdtSession
-    preview_data_url: str
-    operations: list[dict[str, Any]] = field(default_factory=list)
+    state_payload: dict[str, object]
+    preview_data_url: str | None
+    max_tool_calls: int = 12
+    tool_calls_used: int = 0
+    applied_operations: list[dict[str, object]] = field(default_factory=list)
+    render_event: threading.Event = field(default_factory=threading.Event)
+    rendered_preview_bytes: bytes | None = None
+    requires_render_callback: bool = False
     completed_plan: AgentPlan | None = None
 
 
@@ -82,31 +102,22 @@ class CodexTurnResult:
     raw_message: str
 
 
-def _build_output_schema() -> dict[str, Any]:
-    schema = AgentPlan.model_json_schema()
+def _data_url(image_bytes: bytes, mime_type: str, *, revision_token: str) -> str:
+    encoded = base64.b64encode(image_bytes).decode()
+    return f"data:{mime_type};revision={revision_token};base64,{encoded}"
 
-    def _rewrite(node: Any) -> None:
-        if isinstance(node, dict):
-            properties = node.get("properties")
-            if isinstance(properties, dict):
-                node["required"] = list(properties)
-                node.setdefault("additionalProperties", False)
-                for child in properties.values():
-                    _rewrite(child)
-            for key in ("items", "anyOf", "allOf", "oneOf", "prefixItems", "$defs"):
-                child = node.get(key)
-                if isinstance(child, dict):
-                    for grandchild in child.values():
-                        _rewrite(grandchild)
-                elif isinstance(child, list):
-                    for grandchild in child:
-                        _rewrite(grandchild)
-        elif isinstance(node, list):
-            for child in node:
-                _rewrite(child)
 
-    _rewrite(schema)
-    return cast(dict[str, Any], schema)
+def _build_state_payload(request: RequestEnvelope) -> dict[str, object]:
+    return {
+        "uiContext": request.uiContext.model_dump(mode="json"),
+        "capabilityManifest": request.capabilityManifest.model_dump(mode="json"),
+        "imageSnapshot": request.imageSnapshot.model_dump(mode="json"),
+        "moduleCatalog": module_catalog(),
+    }
+
+
+def _build_output_schema() -> dict[str, object]:
+    return cast(dict[str, object], AgentPlan.model_json_schema())
 
 
 class CodexAppServerBridge:
@@ -118,13 +129,9 @@ class CodexAppServerBridge:
         timeout_seconds: float = 600.0,
     ) -> None:
         if command is None:
-            configured_env = None
-            try:
-                import os
+            import os
 
-                configured_env = os.environ.get("VKDT_AGENT_CODEX_APP_SERVER_CMD")
-            except Exception:
-                configured_env = None
+            configured_env = os.environ.get("VKDT_AGENT_CODEX_APP_SERVER_CMD")
             command = (
                 shlex.split(configured_env)
                 if configured_env
@@ -133,38 +140,229 @@ class CodexAppServerBridge:
         self._command = list(command)
         self._cwd = str((cwd or Path(__file__).resolve().parent.parent).resolve())
         self._timeout_seconds = timeout_seconds
+        self._lock = threading.Lock()
+        self._state_lock = threading.Lock()
         self._process: subprocess.Popen[str] | None = None
         self._initialized = False
         self._next_request_id = 1
-        self._lock = threading.Lock()
-        self._active_requests: dict[str, ActiveRequest] = {}
         self._conversation_threads: dict[str, str] = {}
+        self._active_requests: dict[str, ActiveRequest] = {}
+        self._cancelled_requests: dict[CancelRequestKey, str] = {}
         self._turn_contexts: dict[tuple[str, str], TurnContext] = {}
 
     def plan(self, request: RequestEnvelope) -> CodexTurnResult:
         deadline = time.monotonic() + self._timeout_seconds
-        active = ActiveRequest(
-            request_id=request.requestId,
-            conversation_id=request.session.conversationId,
-            client_turn_id=request.session.turnId,
-        )
-        self._active_requests[request.requestId] = active
+        active = self._register_request(request)
         try:
             with self._lock:
+                self._set_active_request_status_locked(
+                    request.requestId,
+                    status="initializing",
+                    message="Initializing Codex app server",
+                )
                 self._ensure_initialized(deadline)
                 thread_id = self._get_or_create_thread(
                     request.session.conversationId, deadline
                 )
                 active.thread_id = thread_id
+                self._set_active_request_status_locked(
+                    request.requestId,
+                    status="starting-turn",
+                    message="Starting Codex turn",
+                )
                 return self._run_turn(thread_id, request, deadline, active)
         finally:
-            self._active_requests.pop(request.requestId, None)
+            self._unregister_request(request.requestId)
+
+    def cancel_request(
+        self,
+        *,
+        request_id: str,
+        app_session_id: str,
+        image_session_id: str,
+        conversation_id: str,
+        turn_id: str,
+        reason: str | None = None,
+    ) -> bool:
+        cancel_key = CancelRequestKey(
+            request_id=request_id,
+            app_session_id=app_session_id,
+            image_session_id=image_session_id,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+        )
+        matched = False
+        with self._state_lock:
+            self._cancelled_requests[cancel_key] = reason or "Chat request was canceled"
+            active = self._active_requests.get(request_id)
+            if active and active.cancel_key == cancel_key:
+                active.cancel_event.set()
+                active.cancel_reason = reason
+                active.status = "cancel-requested"
+                active.message = reason or "Cancellation requested"
+                matched = True
+        return matched
+
+    def get_request_progress(
+        self,
+        *,
+        request_id: str,
+        app_session_id: str,
+        image_session_id: str,
+        conversation_id: str,
+        turn_id: str,
+    ) -> dict[str, object]:
+        with self._state_lock:
+            active = self._active_requests.get(request_id)
+            if active is None:
+                return {
+                    "found": False,
+                    "status": "not_found",
+                    "toolCallsUsed": 0,
+                    "maxToolCalls": 0,
+                    "appliedOperationCount": 0,
+                    "operations": [],
+                    "latestOperation": None,
+                    "message": "No active request found for that requestId.",
+                    "lastToolName": None,
+                    "progressVersion": 0,
+                    "requiresRenderCallback": False,
+                }
+            if (
+                active.app_session_id != app_session_id
+                or active.image_session_id != image_session_id
+                or active.conversation_id != conversation_id
+                or active.client_turn_id != turn_id
+            ):
+                return {
+                    "found": False,
+                    "status": "not_found",
+                    "toolCallsUsed": 0,
+                    "maxToolCalls": 0,
+                    "appliedOperationCount": 0,
+                    "operations": [],
+                    "latestOperation": None,
+                    "message": (
+                        "No active request matched the provided session identifiers."
+                    ),
+                    "lastToolName": None,
+                    "progressVersion": 0,
+                    "requiresRenderCallback": False,
+                }
+            context = None
+            if active.thread_id and active.codex_turn_id:
+                context = self._turn_contexts.get(
+                    (active.thread_id, active.codex_turn_id)
+                )
+            operations = list(context.applied_operations) if context else []
+            return {
+                "found": True,
+                "status": active.status,
+                "toolCallsUsed": context.tool_calls_used if context else 0,
+                "maxToolCalls": context.max_tool_calls if context else 0,
+                "appliedOperationCount": len(operations),
+                "operations": operations,
+                "latestOperation": operations[-1] if operations else None,
+                "message": active.message,
+                "lastToolName": active.last_tool_name,
+                "progressVersion": active.progress_version,
+                "requiresRenderCallback": context.requires_render_callback
+                if context
+                else False,
+            }
+
+    def provide_render_callback(
+        self,
+        *,
+        image_session_id: str,
+        turn_id: str,
+        image_bytes: bytes,
+    ) -> bool:
+        with self._state_lock:
+            for active in self._active_requests.values():
+                if (
+                    active.image_session_id == image_session_id
+                    and active.client_turn_id == turn_id
+                    and active.thread_id
+                    and active.codex_turn_id
+                ):
+                    context = self._turn_contexts.get(
+                        (active.thread_id, active.codex_turn_id)
+                    )
+                    if context is None:
+                        return False
+                    context.rendered_preview_bytes = image_bytes
+                    context.render_event.set()
+                    context.requires_render_callback = False
+                    active.progress_version += 1
+                    active.message = "Received refreshed native preview"
+                    return True
+        return False
+
+    def _register_request(self, request: RequestEnvelope) -> ActiveRequest:
+        active = ActiveRequest(
+            request_id=request.requestId,
+            app_session_id=request.session.appSessionId,
+            image_session_id=request.session.imageSessionId,
+            conversation_id=request.session.conversationId,
+            client_turn_id=request.session.turnId,
+        )
+        with self._state_lock:
+            self._active_requests[request.requestId] = active
+            cancel_reason = self._cancelled_requests.get(active.cancel_key)
+            if cancel_reason:
+                active.cancel_event.set()
+                active.cancel_reason = cancel_reason
+        return active
+
+    def _unregister_request(self, request_id: str) -> None:
+        with self._state_lock:
+            active = self._active_requests.pop(request_id, None)
+            if active is not None:
+                self._cancelled_requests.pop(active.cancel_key, None)
+
+    def _raise_if_cancelled_locked(self, active: ActiveRequest | None) -> None:
+        if active is None:
+            return
+        with self._state_lock:
+            cancelled = active.cancel_event.is_set()
+        if not cancelled:
+            return
+        self._set_active_request_status_locked(
+            active.request_id,
+            status="cancelled",
+            message=active.cancel_reason or "Chat request was canceled",
+        )
+        self._reset_process_locked()
+        raise CodexAppServerError(
+            "request_cancelled",
+            active.cancel_reason or "Chat request was canceled",
+            status_code=499,
+        )
+
+    def _set_active_request_status_locked(
+        self,
+        request_id: str,
+        *,
+        status: str,
+        message: str,
+        last_tool_name: str | None = None,
+    ) -> None:
+        with self._state_lock:
+            active = self._active_requests.get(request_id)
+            if active is None:
+                return
+            active.status = status
+            active.message = message
+            if last_tool_name is not None:
+                active.last_tool_name = last_tool_name
+            active.progress_version += 1
 
     def _ensure_initialized(self, deadline: float) -> None:
         if self._process and self._process.poll() is not None:
-            self._reset_process()
+            self._reset_process_locked()
         if not self._process:
-            self._start_process()
+            self._start_process_locked()
         if self._initialized:
             return
         response = self._send_request(
@@ -173,7 +371,7 @@ class CodexAppServerBridge:
                 "clientInfo": {
                     "name": "vkdtAgent",
                     "title": "vkdt Agent",
-                    "version": "0.1.0",
+                    "version": "0.2.0",
                 },
                 "capabilities": {
                     "experimentalApi": True,
@@ -181,6 +379,7 @@ class CodexAppServerBridge:
                 },
             },
             deadline,
+            None,
         )
         if "result" not in response:
             raise CodexAppServerError(
@@ -189,7 +388,7 @@ class CodexAppServerBridge:
         self._send_notification("initialized")
         self._initialized = True
 
-    def _start_process(self) -> None:
+    def _start_process_locked(self) -> None:
         try:
             self._process = subprocess.Popen(
                 self._command,
@@ -207,7 +406,7 @@ class CodexAppServerBridge:
                 status_code=503,
             ) from exc
 
-    def _reset_process(self) -> None:
+    def _reset_process_locked(self) -> None:
         if self._process:
             try:
                 self._process.kill()
@@ -224,7 +423,7 @@ class CodexAppServerBridge:
         self._turn_contexts.clear()
 
     def _send_notification(self, method: str, params: object | None = None) -> None:
-        payload: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        payload: dict[str, object] = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             payload["params"] = params
         self._send_json(payload)
@@ -234,25 +433,28 @@ class CodexAppServerBridge:
         method: str,
         params: object,
         deadline: float,
-    ) -> dict[str, Any]:
+        active: ActiveRequest | None,
+    ) -> dict[str, object]:
         request_id = self._next_request_id
         self._next_request_id += 1
         self._send_json(
             {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
         )
         while True:
-            message = self._read_message(deadline)
+            self._raise_if_cancelled_locked(active)
+            message = self._read_message(deadline, active)
             if message.get("id") == request_id and "method" not in message:
                 error = message.get("error")
                 if isinstance(error, dict):
+                    error_dict = cast(dict[str, object], error)
                     raise CodexAppServerError(
                         "codex_jsonrpc_error",
-                        str(error.get("message") or f"Codex {method} failed"),
+                        str(error_dict.get("message") or f"Codex {method} failed"),
                     )
                 return message
             self._handle_message(message, None)
 
-    def _send_json(self, payload: dict[str, Any]) -> None:
+    def _send_json(self, payload: dict[str, object]) -> None:
         if not self._process or not self._process.stdin:
             raise CodexAppServerError(
                 "codex_process_unavailable", "Codex app server is not running"
@@ -261,13 +463,18 @@ class CodexAppServerBridge:
         self._process.stdin.flush()
 
     def _read_message(
-        self, deadline: float, *, max_wait_seconds: float | None = None
-    ) -> dict[str, Any]:
+        self,
+        deadline: float,
+        active: ActiveRequest | None,
+        *,
+        max_wait_seconds: float | None = None,
+    ) -> dict[str, object]:
         if not self._process or not self._process.stdout or not self._process.stderr:
             raise CodexAppServerError(
                 "codex_process_unavailable", "Codex app server is not running"
             )
         while True:
+            self._raise_if_cancelled_locked(active)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise CodexAppServerError(
@@ -292,7 +499,7 @@ class CodexAppServerBridge:
                     continue
                 payload = json.loads(line)
                 if isinstance(payload, dict):
-                    return cast(dict[str, Any], payload)
+                    return cast(dict[str, object], payload)
 
     def _get_or_create_thread(self, conversation_id: str, deadline: float) -> str:
         existing = self._conversation_threads.get(conversation_id)
@@ -310,9 +517,10 @@ class CodexAppServerBridge:
                 "model": "gpt-5.4",
             },
             deadline,
+            None,
         )
-        result = cast(dict[str, Any], response.get("result") or {})
-        thread = cast(dict[str, Any], result.get("thread") or {})
+        result = cast(dict[str, object], response.get("result") or {})
+        thread = cast(dict[str, object], result.get("thread") or {})
         thread_id = thread.get("id")
         if not isinstance(thread_id, str) or not thread_id:
             raise CodexAppServerError(
@@ -328,8 +536,25 @@ class CodexAppServerBridge:
         deadline: float,
         active: ActiveRequest,
     ) -> CodexTurnResult:
-        session = VkdtSession.create(request)
-        turn_input = self._build_turn_input(request, session)
+        preview = request.imageSnapshot.preview
+        preview_data_url = (
+            f"data:{preview.mimeType};base64,{preview.base64Data}" if preview else None
+        )
+        turn_input: list[dict[str, str]] = [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "requestId": request.requestId,
+                        "message": request.message.text,
+                        "state": _build_state_payload(request),
+                    },
+                    separators=(",", ":"),
+                ),
+            }
+        ]
+        if preview_data_url:
+            turn_input.append({"type": "image", "url": preview_data_url})
         response = self._send_request(
             "turn/start",
             {
@@ -342,22 +567,28 @@ class CodexAppServerBridge:
                 "model": "gpt-5.4",
             },
             deadline,
+            active,
         )
-        result = cast(dict[str, Any], response.get("result") or {})
-        turn = cast(dict[str, Any], result.get("turn") or {})
+        result = cast(dict[str, object], response.get("result") or {})
+        turn = cast(dict[str, object], result.get("turn") or {})
         turn_id = turn.get("id")
         if not isinstance(turn_id, str) or not turn_id:
             raise CodexAppServerError(
                 "codex_turn_start_failed", "Codex did not return a turn id"
             )
-        active.turn_id = turn_id
+        active.codex_turn_id = turn_id
         context = TurnContext(
             request=request,
-            session=session,
-            preview_data_url=self._preview_data_url(session.preview),
+            state_payload=_build_state_payload(request),
+            preview_data_url=preview_data_url,
         )
         self._turn_contexts[(thread_id, turn_id)] = context
-        state: dict[str, Any] = {
+        self._set_active_request_status_locked(
+            active.request_id,
+            status="running",
+            message="Waiting for Codex turn output",
+        )
+        state: dict[str, object] = {
             "thread_id": thread_id,
             "turn_id": turn_id,
             "chunks": [],
@@ -366,8 +597,8 @@ class CodexAppServerBridge:
             "turn_error": None,
         }
         try:
-            while not state["completed"]:
-                message = self._read_message(deadline, max_wait_seconds=0.5)
+            while not bool(state["completed"]):
+                message = self._read_message(deadline, active, max_wait_seconds=0.5)
                 if not message:
                     if context.completed_plan is not None:
                         state["final_message"] = (
@@ -379,76 +610,40 @@ class CodexAppServerBridge:
                 if context.completed_plan is not None:
                     state["final_message"] = context.completed_plan.model_dump_json()
                     state["completed"] = True
-            if state["turn_error"]:
-                raise CodexAppServerError("codex_turn_failed", state["turn_error"])
-            raw_message = state["final_message"] or "".join(state["chunks"]).strip()
+            turn_error = state["turn_error"]
+            if isinstance(turn_error, str) and turn_error:
+                raise CodexAppServerError("codex_turn_failed", turn_error)
+            raw_message = state["final_message"] or "".join(
+                cast(list[str], state["chunks"])
+            )
             if not raw_message:
                 raise CodexAppServerError(
                     "codex_empty_response", "Codex completed without returning a plan"
                 )
-            plan = AgentPlan.model_validate_json(raw_message)
+            plan = AgentPlan.model_validate_json(cast(str, raw_message))
             return CodexTurnResult(
                 plan=plan, thread_id=thread_id, turn_id=turn_id, raw_message=raw_message
             )
         finally:
             self._turn_contexts.pop((thread_id, turn_id), None)
+            active.codex_turn_id = None
 
     @staticmethod
-    def _preview_data_url(preview: object | None) -> str:
-        if preview is None:
-            return ""
-        from shared.protocol import PreviewImage
-
-        if isinstance(preview, PreviewImage):
-            return f"data:{preview.mimeType};base64,{preview.base64Data}"
-        return ""
-
-    def _build_turn_input(
-        self, request: RequestEnvelope, session: VkdtSession
-    ) -> list[dict[str, str]]:
-        workflow = session.workflow_state()
-        payload = {
-            "requestId": request.requestId,
-            "conversationId": request.session.conversationId,
-            "turnId": request.session.turnId,
-            "imagePath": request.workspace.imagePath,
-            "message": request.message.text,
-            "graphPath": workflow.graphPath,
-            "workflow": workflow.model_dump(mode="json"),
-        }
-        items = [{"type": "text", "text": json.dumps(payload, separators=(",", ":"))}]
-        if workflow.preview is not None:
-            items.append(
-                {"type": "image", "url": self._preview_data_url(workflow.preview)}
-            )
-        return items
-
-    def _dynamic_tools(self) -> list[dict[str, Any]]:
-        empty_object = {
-            "type": "object",
-            "properties": {},
-            "additionalProperties": False,
-        }
+    def _dynamic_tools() -> list[dict[str, object]]:
+        empty = {"type": "object", "properties": {}, "additionalProperties": False}
         return [
             {
-                "name": "get_workflow_state",
+                "name": "get_image_state",
                 "description": (
-                    "Get the current vkdt graph, module summary, connections, "
-                    "preview metadata, and export artifacts."
+                    "Get the latest native vkdt image state, editable "
+                    "controls, graph summary, and surfaced adjustment modules."
                 ),
-                "inputSchema": empty_object,
+                "inputSchema": empty,
             },
             {
                 "name": "get_preview_image",
-                "description": "Get the current rendered preview image as a data URL.",
-                "inputSchema": empty_object,
-            },
-            {
-                "name": "get_module_catalog",
-                "description": (
-                    "Get the built-in vkdt module catalog for core editing workflows."
-                ),
-                "inputSchema": empty_object,
+                "description": "Get the latest native vkdt preview as a data URL.",
+                "inputSchema": empty,
             },
             {
                 "name": "get_playbook",
@@ -463,49 +658,29 @@ class CodexAppServerBridge:
                 },
             },
             {
-                "name": "apply_graph_edits",
+                "name": "apply_operations",
                 "description": (
-                    "Apply vkdt graph edits, validate the graph, render a "
-                    "refreshed preview, and return the updated workflow state."
+                    "Send native vkdt operations to the app, wait for "
+                    "refreshed preview/state, and continue once the UI render "
+                    "callback arrives."
                 ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "edits": {
+                        "operations": {
                             "type": "array",
                             "minItems": 1,
                             "items": {"type": "object"},
                         }
                     },
-                    "required": ["edits"],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "name": "render_export",
-                "description": (
-                    "Render a final export through vkdt-cli and return the "
-                    "produced artifact path."
-                ),
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "format": {"type": "string"},
-                        "filename": {"type": "string"},
-                        "width": {"type": "integer"},
-                        "height": {"type": "integer"},
-                        "quality": {"type": "number"},
-                        "output": {"type": "string"},
-                        "lastFrameOnly": {"type": "boolean"},
-                    },
-                    "required": ["format", "filename"],
+                    "required": ["operations"],
                     "additionalProperties": False,
                 },
             },
             {
                 "name": "end",
                 "description": (
-                    "Finish the live run and record the final assistant message."
+                    "Finish the native live run with the final assistant message."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -517,7 +692,7 @@ class CodexAppServerBridge:
         ]
 
     def _handle_message(
-        self, message: dict[str, Any], state: dict[str, Any] | None
+        self, message: dict[str, object], state: dict[str, object] | None
     ) -> None:
         if "method" in message and "id" in message:
             self._handle_server_request(message)
@@ -525,7 +700,7 @@ class CodexAppServerBridge:
         method = message.get("method")
         if not isinstance(method, str) or state is None:
             return
-        params = cast(dict[str, Any], message.get("params") or {})
+        params = cast(dict[str, object], message.get("params") or {})
         if method == "item/agentMessage/delta":
             if (
                 params.get("threadId") == state["thread_id"]
@@ -533,7 +708,7 @@ class CodexAppServerBridge:
             ):
                 delta = params.get("delta")
                 if isinstance(delta, str):
-                    state["chunks"].append(delta)
+                    cast(list[str], state["chunks"]).append(delta)
             return
         if method == "item/completed":
             if (
@@ -541,7 +716,7 @@ class CodexAppServerBridge:
                 or params.get("turnId") != state["turn_id"]
             ):
                 return
-            item = cast(dict[str, Any], params.get("item") or {})
+            item = cast(dict[str, object], params.get("item") or {})
             if item.get("type") == "agentMessage":
                 text = item.get("text")
                 if isinstance(text, str):
@@ -552,19 +727,18 @@ class CodexAppServerBridge:
         if method == "turn/completed":
             if params.get("threadId") != state["thread_id"]:
                 return
-            turn = cast(dict[str, Any], params.get("turn") or {})
+            turn = cast(dict[str, object], params.get("turn") or {})
             if turn.get("id") != state["turn_id"]:
                 return
-            error = (
-                cast(dict[str, Any], turn.get("error") or {})
-                if isinstance(turn.get("error"), dict)
-                else {}
-            )
-            if error:
-                state["turn_error"] = str(error.get("message") or "Codex turn failed")
+            error = turn.get("error")
+            if isinstance(error, dict):
+                error_dict = cast(dict[str, object], error)
+                state["turn_error"] = str(
+                    error_dict.get("message") or "Codex turn failed"
+                )
             state["completed"] = True
 
-    def _handle_server_request(self, message: dict[str, Any]) -> None:
+    def _handle_server_request(self, message: dict[str, object]) -> None:
         request_id = message.get("id")
         method = message.get("method")
         if request_id is None or not isinstance(method, str):
@@ -592,11 +766,11 @@ class CodexAppServerBridge:
                 }
             )
             return
-        params = cast(dict[str, Any], message.get("params") or {})
+        params = cast(dict[str, object], message.get("params") or {})
         thread_id = params.get("threadId")
         turn_id = params.get("turnId")
         tool = params.get("tool")
-        arguments = cast(dict[str, Any], params.get("arguments") or {})
+        arguments = cast(dict[str, object], params.get("arguments") or {})
         context = (
             self._turn_contexts.get((thread_id, turn_id))
             if isinstance(thread_id, str) and isinstance(turn_id, str)
@@ -611,122 +785,134 @@ class CodexAppServerBridge:
                 }
             )
             return
-        if tool == "get_workflow_state":
-            payload = {
+        response = self._handle_dynamic_tool_call(context, tool, arguments)
+        self._send_json({"jsonrpc": "2.0", "id": request_id, "result": response})
+
+    def _handle_dynamic_tool_call(
+        self,
+        context: TurnContext,
+        tool: str,
+        arguments: dict[str, object],
+    ) -> dict[str, object]:
+        context.tool_calls_used += 1
+        self._set_active_request_status_locked(
+            context.request.requestId,
+            status="running",
+            message=f"Handling tool {tool}",
+            last_tool_name=tool,
+        )
+        if tool == "get_image_state":
+            return {
                 "success": True,
                 "contentItems": [
                     {
                         "type": "inputText",
-                        "text": context.session.workflow_state().model_dump_json(),
+                        "text": json.dumps(
+                            context.state_payload, separators=(",", ":")
+                        ),
                     }
                 ],
             }
-        elif tool == "get_preview_image":
-            payload = {
+        if tool == "get_preview_image":
+            if context.preview_data_url is None:
+                return self._tool_error("No preview image is available yet.")
+            return {
                 "success": True,
                 "contentItems": [
-                    {
-                        "type": "inputImage",
-                        "imageUrl": self._preview_data_url(context.session.preview),
-                    }
+                    {"type": "inputImage", "imageUrl": context.preview_data_url}
                 ],
             }
-        elif tool == "get_module_catalog":
-            payload = {
-                "success": True,
-                "contentItems": [
-                    {
-                        "type": "inputText",
-                        "text": json.dumps(module_catalog(), separators=(",", ":")),
-                    }
-                ],
-            }
-        elif tool == "get_playbook":
+        if tool == "get_playbook":
             playbook_id = arguments.get("playbookId")
             if not isinstance(playbook_id, str):
-                payload = self._tool_error("get_playbook requires a playbookId string.")
-            else:
-                payload = {
-                    "success": True,
-                    "contentItems": [
-                        {
-                            "type": "inputText",
-                            "text": json.dumps(
-                                get_playbook(playbook_id), separators=(",", ":")
-                            ),
-                        }
-                    ],
-                }
-        elif tool == "apply_graph_edits":
+                return self._tool_error("get_playbook requires a playbookId string.")
             try:
-                raw_edits = arguments.get("edits")
-                if not isinstance(raw_edits, list):
-                    raise ValueError("apply_graph_edits requires an edits array")
-                edits = [GraphEdit.model_validate(item) for item in raw_edits]
-                applied = context.session.apply_edits(edits)
-                context.operations.extend(applied)
-                payload = {
-                    "success": True,
-                    "contentItems": [
-                        {
-                            "type": "inputText",
-                            "text": (
-                                f"Applied {len(applied)} graph edits and "
-                                "rendered a refreshed preview."
-                            ),
-                        },
-                        {
-                            "type": "inputImage",
-                            "imageUrl": self._preview_data_url(context.session.preview),
-                        },
-                        {
-                            "type": "inputText",
-                            "text": context.session.workflow_state().model_dump_json(),
-                        },
-                    ],
-                }
-            except Exception as exc:
-                payload = self._tool_error(str(exc))
-        elif tool == "render_export":
-            try:
-                export = ExportRequest.model_validate(arguments)
-                artifact = context.session.render_export(export)
-                payload = {
-                    "success": True,
-                    "contentItems": [
-                        {
-                            "type": "inputText",
-                            "text": json.dumps(
-                                artifact.model_dump(mode="json"), separators=(",", ":")
-                            ),
-                        }
-                    ],
-                }
-            except Exception as exc:
-                payload = self._tool_error(str(exc))
-        elif tool == "end":
-            message_text = arguments.get("message")
-            if not isinstance(message_text, str) or not message_text.strip():
-                payload = self._tool_error("end requires a non-empty message string.")
-            else:
-                context.completed_plan = AgentPlan(
-                    assistantText=message_text.strip(),
-                    continueRefining=False,
-                    operations=[
-                        GraphEdit.model_validate(item) for item in context.operations
-                    ],
-                    workflow=context.session.workflow_state(),
+                playbook = get_playbook(playbook_id)
+            except ValueError as exc:
+                return self._tool_error(str(exc))
+            return {
+                "success": True,
+                "contentItems": [
+                    {
+                        "type": "inputText",
+                        "text": json.dumps(playbook, separators=(",", ":")),
+                    }
+                ],
+            }
+        if tool == "apply_operations":
+            raw_operations = arguments.get("operations")
+            if not isinstance(raw_operations, list):
+                return self._tool_error(
+                    "apply_operations requires an operations array."
                 )
-                payload = {
-                    "success": True,
-                    "contentItems": [{"type": "inputText", "text": "Run completed."}],
-                }
-        else:
-            payload = self._tool_error(f"Unsupported tool '{tool}'.")
-        self._send_json({"jsonrpc": "2.0", "id": request_id, "result": payload})
+            try:
+                operations = [
+                    GraphOperation.model_validate(item) for item in raw_operations
+                ]
+            except Exception as exc:
+                return self._tool_error(str(exc))
+            context.applied_operations.extend(
+                op.model_dump(mode="json") for op in operations
+            )
+            context.render_event.clear()
+            context.requires_render_callback = True
+            self._set_active_request_status_locked(
+                context.request.requestId,
+                status="waiting-render",
+                message="Waiting for the native vkdt preview refresh",
+                last_tool_name=tool,
+            )
+            render_arrived = context.render_event.wait(timeout=15.0)
+            if not render_arrived or context.rendered_preview_bytes is None:
+                context.requires_render_callback = False
+                return self._tool_error(
+                    "Timed out waiting for the native vkdt render callback."
+                )
+            context.preview_data_url = _data_url(
+                context.rendered_preview_bytes,
+                "image/jpeg",
+                revision_token=str(len(context.applied_operations)),
+            )
+            context.state_payload["renderRevision"] = len(context.applied_operations)
+            return {
+                "success": True,
+                "contentItems": [
+                    {
+                        "type": "inputText",
+                        "text": (
+                            f"Applied {len(operations)} native operations and "
+                            "received a refreshed preview."
+                        ),
+                    },
+                    {"type": "inputImage", "imageUrl": context.preview_data_url},
+                    {
+                        "type": "inputText",
+                        "text": json.dumps(
+                            context.state_payload, separators=(",", ":")
+                        ),
+                    },
+                ],
+            }
+        if tool == "end":
+            message = arguments.get("message")
+            if not isinstance(message, str) or not message.strip():
+                return self._tool_error("end requires a non-empty message string.")
+            context.completed_plan = AgentPlan(
+                assistantText=message.strip(),
+                continueRefining=False,
+                operations=[
+                    GraphOperation.model_validate(item)
+                    for item in context.applied_operations
+                ],
+            )
+            return {
+                "success": True,
+                "contentItems": [{"type": "inputText", "text": "Run completed."}],
+            }
+        return self._tool_error(f"Unsupported tool '{tool}'.")
 
     @staticmethod
-    def _tool_error(message: str) -> dict[str, Any]:
+    def _tool_error(message: str) -> dict[str, object]:
         return {
             "success": False,
             "contentItems": [{"type": "inputText", "text": message}],

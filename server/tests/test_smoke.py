@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from fastapi.testclient import TestClient
 
 from server import app as app_module
+from server.tests.test_api import sample_request
 
 
 def test_health() -> None:
@@ -14,38 +13,18 @@ def test_health() -> None:
     assert response.json() == {"status": "ok"}
 
 
-def test_mock_chat_smoke(monkeypatch, tmp_path: Path) -> None:
+def test_mock_chat_smoke(monkeypatch) -> None:
     monkeypatch.setenv("VKDT_AGENT_USE_MOCK_RESPONSES", "1")
     client = TestClient(app_module.app)
-    response = client.post(
-        "/v1/chat",
-        json={
-            "schemaVersion": "1.0",
-            "requestId": "req-smoke",
-            "session": {
-                "appSessionId": "app-1",
-                "imageSessionId": "img-1",
-                "conversationId": "conv-1",
-                "turnId": "turn-1",
-            },
-            "message": {"role": "user", "text": "Give this a clean natural edit"},
-            "workspace": {
-                "imagePath": "/tmp/source.raw",
-                "sessionRoot": str(tmp_path),
-                "previewWidth": 64,
-                "previewHeight": 64,
-            },
-            "fast": False,
-            "refinement": {
-                "mode": "multi-turn",
-                "enabled": True,
-                "maxPasses": 5,
-                "passIndex": 1,
-                "goalText": "Give this a clean natural edit",
-            },
-        },
-    )
+    response = client.post("/v1/chat", json=sample_request())
     assert response.status_code == 200
-    payload = response.json()
-    assert payload["assistantMessage"]["text"]
-    assert payload["workflow"]["preview"]["base64Data"]
+    assert response.json()["assistantMessage"]["text"]
+
+
+def test_stream_smoke(monkeypatch) -> None:
+    monkeypatch.setenv("VKDT_AGENT_USE_MOCK_RESPONSES", "1")
+    client = TestClient(app_module.app)
+    with client.stream("POST", "/v1/chat/stream", json=sample_request()) as response:
+        body = "".join(chunk for chunk in response.iter_text())
+    assert response.status_code == 200
+    assert "event: final" in body
