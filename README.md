@@ -47,6 +47,17 @@ The backend runs on `http://127.0.0.1:4000` by default.
 5. Native `vkdt` rerenders and posts the refreshed preview to `/v1/chat/render`.
 6. Codex continues iterating until it calls `end`.
 
+## Native Patch Assets
+
+The repo now includes a concrete upstream `vkdt` patch path:
+
+- `native/vkdt-bridge.c`
+- `native/vkdt-bridge.h`
+- `native/vkdt_agent_bridge_helper.py`
+- `scripts/apply_vkdt_native_patch.py`
+
+See `docs/native-vkdt-testing.md` for the apply/build/run path.
+
 ## Adjustment Surfaces
 
 The backend keeps a broad built-in planning vocabulary for `vkdt`, including:

@@ -8,3 +8,5 @@ build/
 .DS_Store
 .tmp/
 tmp/
+upstream-vkdt/
+.vkdt-agent-session/

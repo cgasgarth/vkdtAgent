@@ -1,0 +1,106 @@
+src/gui/flat.mk           |  2 ++
+ src/gui/gui.h             |  1 +
+ src/gui/main.c            |  4 ++++
+ src/gui/render_darkroom.c | 24 +++++++++++++++---------
+ src/gui/render_darkroom.h |  4 ++++
+ 5 files changed, 26 insertions(+), 9 deletions(-)
+
+--- Changes ---
+
+unknown
+  @@ -1,4 +1,5 @@
+  +      gui/bridge.o\
+         gui/render.o\
+         gui/render_lighttable.o\
+         gui/render_darkroom.o\
+  @@ -7,6 +8,7 @@ GUI_O=gui/gui.o\
+  +      gui/bridge.h\
+         gui/menu.h\
+         gui/render.h\
+         gui/render_view.h\
+  +2 -0
+
+unknown
+  @@ -71,6 +71,7 @@ typedef enum dt_gui_popup_t
+  +  s_popup_agent_prompt,
+     s_popup_edit_hotkeys,
+     s_popup_hotkeys,
+   } dt_gui_popup_t;
+  +1 -0
+
+unknown
+  @@ -11,6 +11,7 @@
+  +#include "gui/bridge.h"
+   #include "gui/api.h"
+   #include "db/db.h"
+   #include "nk.h"
+  @@ -260,6 +261,7 @@ int main(int argc, char *argv[])
+  +  dt_bridge_init();
+   
+     // joystick polling interval in seconds
+     const double joystick_poll_interval = 0.005; // 200Hz
+  @@ -330,6 +332,7 @@ int main(int argc, char *argv[])
+  +    dt_bridge_poll_mainthread();
+       dt_view_process(); // process before render/preset because this might swap the output image backbuffers
+       if(vkdt.graph_dev.gui_msg && vkdt.graph_dev.gui_msg[0]) dt_gui_notification(vkdt.graph_dev.gui_msg);
+       double t1 = dt_time();
+  @@ -358,6 +361,7 @@ int main(int argc, char *argv[])
+  +  dt_bridge_cleanup();
+     dt_thumbnails_cleanup(&vkdt.thumbnails);
+     dt_thumbnails_cleanup(&vkdt.thumbnail_gen);
+     dt_gui_cleanup();
+  +4 -0
+
+unknown
+  @@ -22,6 +22,7 @@
+  +#include "gui/bridge.h"
+   #include "gui/api_gui.h"
+   #include "gui/widget_dopesheet.h"
+   #include "gui/widget_draw.h"
+  @@ -79,15 +80,16 @@ enum hotkey_names_t
+  -  s_hotkey_dragkey_dec      = 34,
+  -  s_hotkey_dragkey_inc      = 35,
+  -  s_hotkey_dragkey_dec_alt  = 36,
+  -  s_hotkey_dragkey_inc_alt  = 37,
+  -  s_hotkey_dragkey_ydec     = 38,
+  -  s_hotkey_dragkey_yinc     = 39,
+  -  s_hotkey_dragkey_ydec_alt = 40,
+  -  s_hotkey_dragkey_yinc_alt = 41,
+  -  s_hotkey_count            = 42,
+  +  s_hotkey_agent_prompt    = 34,
+  +  s_hotkey_dragkey_dec      = 35,
+  +  s_hotkey_dragkey_inc      = 36,
+  +  s_hotkey_dragkey_dec_alt  = 37,
+  +  s_hotkey_dragkey_inc_alt  = 38,
+  +  s_hotkey_dragkey_ydec     = 39,
+  +  s_hotkey_dragkey_yinc     = 40,
+  +  s_hotkey_dragkey_ydec_alt = 41,
+  +  s_hotkey_dragkey_yinc_alt = 42,
+  +  s_hotkey_count            = 43,
+   };
+   
+   static const int hk_darkroom_size = 128;
+  @@ -128,6 +130,7 @@ static hk_t hk_darkroom[128] = {
+  +  {"agent prompt",    "open the native agent prompt",              {GLFW_KEY_LEFT_CONTROL, GLFW_KEY_G}},
+     {"dragkey dec",       "step armed parameter left",            {GLFW_KEY_LEFT}},
+     {"dragkey inc",       "step armed parameter right",           {GLFW_KEY_RIGHT}},
+     {"dragkey dec alt",   "step armed parameter left (alt)",      {GLFW_KEY_H}},
+  @@ -305,6 +308,9 @@ hotkey_dispatch:
+  +    case s_hotkey_agent_prompt:
+  +      dt_bridge_open_prompt();
+  +      break;
+       default: break; // menu leaders and dragkey step keys are consumed before reaching here
+     }
+   
+  +15 -9
+
+unknown
+  @@ -1678,6 +1678,10 @@ render_darkroom_modals()
+  +  else if(vkdt.wstate.popup == s_popup_agent_prompt)
+  +  {
+  +    dt_bridge_render_modal();
+  +  }
+   }
+   
+   static inline void
+  +4 -0
