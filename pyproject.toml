@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vkdt-agent-backend"
+version = "0.1.0"
+description = "Local backend for a vkdt graph-driven editing agent"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "jinja2>=3.1,<4.0",
+  "pydantic>=2.8,<3.0",
+  "uvicorn>=0.30,<1.0"
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.27,<1.0",
+  "pre-commit>=4.3,<5.0",
+  "pytest>=8.3,<9.0",
+  "ruff>=0.12.0,<0.13.0",
+  "ty>=0.0.1a14,<0.1"
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["server/tests"]
+
+[tool.setuptools.packages.find]
+include = ["server*", "shared*"]
+
+[tool.setuptools.package-data]
+server = ["client/*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+
+[tool.ty.src]
+include = ["server", "shared", "scripts"]
+exclude = ["server/tests"]

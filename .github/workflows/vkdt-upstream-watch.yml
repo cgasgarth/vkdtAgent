@@ -1,0 +1,46 @@
+name: vkdt Upstream Watch
+
+on:
+  schedule:
+    - cron: '0 12 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  upstream-watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: '3.14'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Check tracked upstream commit
+        id: status
+        continue-on-error: true
+        run: uv run python scripts/vkdt_upstream.py status
+
+      - name: Open issue when upstream changed
+        if: steps.status.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "vkdt upstream has moved" \
+            --body "The tracked commit in vkdt-upstream.json no longer matches upstream master. Please review the latest upstream changes and update the vendoring or compatibility notes."

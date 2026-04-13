@@ -1,0 +1,14 @@
+{
+  "name": "vkdt-agent",
+  "private": true,
+  "scripts": {
+    "bootstrap": "uv sync --extra dev",
+    "agent:smoke": "VKDT_AGENT_USE_MOCK_RESPONSES=1 uv run pytest server/tests/test_smoke.py",
+    "backend:format:check": "uv run ruff format --check .",
+    "backend:lint": "uv run ruff check .",
+    "backend:test": "./scripts/test-python.sh",
+    "backend:typecheck": "./scripts/typecheck-python.sh",
+    "server:start": "./scripts/run_server.sh",
+    "vkdt:upstream-status": "uv run python scripts/vkdt_upstream.py status"
+  }
+}

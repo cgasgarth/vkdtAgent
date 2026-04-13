@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>vkdtAgent</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body class="min-h-dvh bg-stone-950 text-stone-100">
+    <div class="mx-auto flex min-h-dvh max-w-7xl flex-col gap-6 px-4 py-6 sm:px-6 lg:px-8">
+      <header class="flex flex-col gap-3 rounded-2xl border border-stone-800 bg-stone-900/80 p-5 shadow-sm">
+        <div class="flex flex-col gap-1">
+          <p class="text-xs font-medium uppercase text-amber-400">vkdtAgent</p>
+          <h1 class="text-3xl font-semibold text-balance">Multi-turn vkdt editing client</h1>
+          <p class="max-w-3xl text-sm text-stone-300 text-pretty">
+            Submit an image path, keep the same conversation alive across turns, and let the agent iteratively inspect, edit, preview, and refine the graph.
+          </p>
+        </div>
+      </header>
+
+      <main class="grid flex-1 gap-6 lg:grid-cols-[24rem_minmax(0,1fr)]">
+        <section class="flex flex-col gap-4 rounded-2xl border border-stone-800 bg-stone-900/80 p-5 shadow-sm">
+          <div class="space-y-1">
+            <h2 class="text-lg font-semibold text-balance">Session</h2>
+            <p class="text-sm text-stone-400 text-pretty">These values persist while you refine the same image.</p>
+          </div>
+
+          <form id="composer" class="flex flex-col gap-4">
+            <label class="flex flex-col gap-2 text-sm">
+              <span class="font-medium text-stone-200">Image path</span>
+              <input id="imagePath" class="rounded-xl border border-stone-700 bg-stone-950 px-3 py-2 text-sm outline-none ring-0 placeholder:text-stone-500 focus:border-amber-400" placeholder="/path/to/image.raw" required />
+            </label>
+
+            <label class="flex flex-col gap-2 text-sm">
+              <span class="font-medium text-stone-200">Working root</span>
+              <input id="sessionRoot" class="rounded-xl border border-stone-700 bg-stone-950 px-3 py-2 text-sm outline-none placeholder:text-stone-500 focus:border-amber-400" placeholder="Optional session directory" />
+            </label>
+
+            <label class="flex flex-col gap-2 text-sm">
+              <span class="font-medium text-stone-200">Graph path</span>
+              <input id="graphPath" class="rounded-xl border border-stone-700 bg-stone-950 px-3 py-2 text-sm outline-none placeholder:text-stone-500 focus:border-amber-400" placeholder="Optional existing working.cfg" />
+            </label>
+
+            <label class="flex flex-col gap-2 text-sm">
+              <span class="font-medium text-stone-200">Prompt</span>
+              <textarea id="prompt" rows="5" class="rounded-xl border border-stone-700 bg-stone-950 px-3 py-2 text-sm outline-none placeholder:text-stone-500 focus:border-amber-400" placeholder="Warm it slightly, recover highlights, and add subtle local contrast." required></textarea>
+            </label>
+
+            <div class="grid grid-cols-2 gap-3">
+              <label class="flex flex-col gap-2 text-sm">
+                <span class="font-medium text-stone-200">Preview width</span>
+                <input id="previewWidth" type="number" min="64" value="1600" class="rounded-xl border border-stone-700 bg-stone-950 px-3 py-2 text-sm outline-none focus:border-amber-400" />
+              </label>
+              <label class="flex flex-col gap-2 text-sm">
+                <span class="font-medium text-stone-200">Preview height</span>
+                <input id="previewHeight" type="number" min="64" value="900" class="rounded-xl border border-stone-700 bg-stone-950 px-3 py-2 text-sm outline-none focus:border-amber-400" />
+              </label>
+            </div>
+
+            <div class="flex items-center justify-between rounded-xl border border-stone-800 bg-stone-950/70 px-3 py-2 text-sm text-stone-300">
+              <span>Conversation</span>
+              <span id="conversationId" class="font-mono text-xs tabular-nums text-stone-400"></span>
+            </div>
+
+            <div id="formError" class="hidden rounded-xl border border-red-800 bg-red-950/50 px-3 py-2 text-sm text-red-200"></div>
+
+            <button id="submitButton" type="submit" class="rounded-xl bg-amber-400 px-4 py-2 text-sm font-semibold text-stone-950 transition hover:bg-amber-300 disabled:cursor-not-allowed disabled:bg-stone-700 disabled:text-stone-300">
+              Run agent turn
+            </button>
+          </form>
+        </section>
+
+        <section class="grid min-h-0 gap-6 lg:grid-rows-[minmax(0,1fr)_20rem]">
+          <div class="grid min-h-0 gap-6 xl:grid-cols-[minmax(0,1fr)_22rem]">
+            <div class="flex min-h-0 flex-col rounded-2xl border border-stone-800 bg-stone-900/80 shadow-sm">
+              <div class="flex items-center justify-between border-b border-stone-800 px-5 py-4">
+                <div>
+                  <h2 class="text-lg font-semibold text-balance">Preview</h2>
+                  <p id="statusText" class="text-sm text-stone-400 text-pretty">Ready for the first turn.</p>
+                </div>
+              </div>
+              <div class="flex min-h-0 flex-1 items-center justify-center p-4">
+                <div id="previewEmpty" class="flex h-full w-full items-center justify-center rounded-2xl border border-dashed border-stone-700 bg-stone-950/60 p-6 text-center text-sm text-stone-500">
+                  Submit a turn to render the current vkdt graph preview.
+                </div>
+                <img id="previewImage" class="hidden max-h-full w-full rounded-2xl border border-stone-800 object-contain" alt="Current vkdt preview" />
+              </div>
+            </div>
+
+            <div class="flex min-h-0 flex-col rounded-2xl border border-stone-800 bg-stone-900/80 shadow-sm">
+              <div class="border-b border-stone-800 px-5 py-4">
+                <h2 class="text-lg font-semibold text-balance">Adjustment surfaces</h2>
+                <p class="text-sm text-stone-400 text-pretty">Current and addable vkdt modules visible to the agent.</p>
+              </div>
+              <div id="surfaces" class="min-h-0 flex-1 overflow-auto px-4 py-4 text-sm text-stone-300"></div>
+            </div>
+          </div>
+
+          <div class="grid min-h-0 gap-6 xl:grid-cols-[minmax(0,1fr)_22rem]">
+            <div class="flex min-h-0 flex-col rounded-2xl border border-stone-800 bg-stone-900/80 shadow-sm">
+              <div class="border-b border-stone-800 px-5 py-4">
+                <h2 class="text-lg font-semibold text-balance">Chat</h2>
+                <p class="text-sm text-stone-400 text-pretty">Each request reuses the same conversation and latest graph path.</p>
+              </div>
+              <div id="messages" class="min-h-0 flex-1 space-y-3 overflow-auto px-4 py-4"></div>
+            </div>
+
+            <div class="flex min-h-0 flex-col rounded-2xl border border-stone-800 bg-stone-900/80 shadow-sm">
+              <div class="border-b border-stone-800 px-5 py-4">
+                <h2 class="text-lg font-semibold text-balance">Workflow</h2>
+                <p class="text-sm text-stone-400 text-pretty">Latest graph file and exports produced during the session.</p>
+              </div>
+              <div class="min-h-0 flex-1 overflow-auto px-4 py-4 text-sm text-stone-300">
+                <dl class="space-y-3">
+                  <div>
+                    <dt class="font-medium text-stone-200">Graph path</dt>
+                    <dd id="workflowGraphPath" class="break-all font-mono text-xs text-stone-400"></dd>
+                  </div>
+                  <div>
+                    <dt class="font-medium text-stone-200">Exports</dt>
+                    <dd id="workflowExports" class="space-y-2"></dd>
+                  </div>
+                </dl>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script type="module" src="/assets/app.js"></script>
+  </body>
+</html>
